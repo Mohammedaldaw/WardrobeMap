@@ -19,7 +19,7 @@ Loaded via **OpenML** (default) or **Keras** (optional).
 
 - **Notebook**: full pipeline (EDA → PCA/SVD → K-Means/DBSCAN → analysis).
 - **Artifacts**: saved PCA + K-Means for fast app startup.
-- **Streamlit app**: tabs for **Report**, **Visualizations**, **Demo**, **README**.
+- **Streamlit app**: tabs for **Report**, **Visualizations**, **Demo**.
 
 ---
 
@@ -95,7 +95,7 @@ python -m pip install -U pip
 pip install streamlit plotly scikit-learn pillow joblib openml tensorflow
 
 ```
-
+--- 
 ### 2) Run the Notebook and create artifacts (one time)
 Open FashionMNIST_Unsupervised_Pipeline.ipynb and execute all cells.
 At the end, run the artifact-saving cell (creates artifacts/ next to the app).

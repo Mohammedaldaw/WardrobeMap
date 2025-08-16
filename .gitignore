@@ -1,38 +1,13 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-*.egg
-
-# Notebooks
-.ipynb_checkpoints/
-
-# Environments
+# virtualenvs
 .venv/
-venv/
-env/
+.venv_app/
 
-# App/IDE caches
-.pytest_cache/
-.mypy_cache/
-.cache/
-*.log
+# data caches / large
+artifacts/*.npz
+artifacts/*.joblib
+
+# OS/editor
 .DS_Store
-
-# Streamlit cache 
-.streamlit/
-
-# Build/outputs
-artifacts/
-models/
-outputs/
-reports/*.pdf
-
-# Big binaries 
-*.joblib
-*.npz
-*.npy
-*.pkl
-*.h5
+Thumbs.db
+__pycache__/
+.ipynb_checkpoints/
