@@ -25,11 +25,51 @@ def to_img(arr01: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, mode="L")
 
 def preprocess_uploaded(file):
-    """Load, convert to gray, center-crop/resize to 28x28, scale [0,1]."""
-    img = Image.open(file).convert("L")
-    img = ImageOps.fit(img, (28, 28))
-    arr = np.array(img).astype("float32") / 255.0
-    return arr
+    """
+    Load an uploaded image and convert it to a 28x28, FMNIST-like tensor in [0,1]:
+      - grayscale
+      - letterbox to 28x28 (no cropping)
+      - auto-invert if background is lighter than the object
+      - light contrast rescale
+    Returns: np.ndarray shape (28,28) float32 in [0,1]
+    """
+    # 1) load & grayscale
+    pil = Image.open(file).convert("L")
+    pil = ImageOps.exif_transpose(pil)
+
+    # 2) letterbox to 28x28 (preserve aspect; pad to square)
+    #    First, scale the longer side to 28 without cropping
+    pil_scaled = ImageOps.contain(pil, (28, 28))
+    w, h = pil_scaled.size
+
+    # Estimate background from original image edges to fill padding
+    arr_full = np.asarray(pil, dtype=np.float32)
+    edges = np.concatenate([
+        arr_full[0, :], arr_full[-1, :], arr_full[:, 0], arr_full[:, -1]
+    ])
+    bg = int(np.median(edges))  # robust fill value
+
+    canvas = Image.new("L", (28, 28), color=bg)
+    offx = (28 - w) // 2
+    offy = (28 - h) // 2
+    canvas.paste(pil_scaled, (offx, offy))
+
+    # 3) auto-invert if border brighter than center (typical for web product photos)
+    arr = np.asarray(canvas, dtype=np.float32)
+    border = np.r_[arr[0:4, :].ravel(), arr[-4:, :].ravel(), arr[:, 0:4].ravel(), arr[:, -4:].ravel()]
+    center = arr[6:22, 6:22].ravel()
+
+    if border.mean() > center.mean():
+        arr = 255.0 - arr  # make foreground bright on dark background
+
+    # 4) contrast rescale (gentle)
+    lo, hi = np.percentile(arr, [2, 98])
+    if hi > lo:
+        arr = np.clip((arr - lo) / (hi - lo), 0, 1)
+    else:
+        arr = arr / 255.0
+
+    return arr.astype("float32")
 
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
@@ -205,62 +245,115 @@ with tab_viz:
 
 # ==================== DEMO ====================
 with tab_demo:
+    from io import BytesIO  # local import
+
     st.header("Image → cluster + similar items")
 
-    left, right = st.columns([1, 1])
+    left, right = st.columns([1, 1], gap="large")
 
+    # ---------- LEFT: input ----------
     with left:
-        mode = st.radio("Input", ["Upload image", "Pick sample"], index=0)
+        st.subheader("Input")
+        mode = st.radio("Source", ["Upload image", "Pick sample"], horizontal=True, index=0)
+
         if mode == "Upload image":
-            f = st.file_uploader("Upload a grayscale clothing image", type=["png","jpg","jpeg","bmp","webp"])
+            f = st.file_uploader(
+                "Upload a clothing image (color or grayscale is fine)",
+                type=["png", "jpg", "jpeg", "bmp", "webp"]
+            )
             if f is None:
                 st.stop()
-            arr = preprocess_uploaded(f)
+
+            content = f.read()
+            pil_orig = Image.open(BytesIO(content)).convert("L")
+            pil_orig = ImageOps.exif_transpose(pil_orig)
+            arr_orig = np.asarray(pil_orig).astype("float32") / 255.0
+
+            # model-ready (28×28, [0,1], normalized + auto-invert if needed)
+            arr_proc = preprocess_uploaded(BytesIO(content))
             title = "Uploaded image"
+
         else:
-            names = [LABELS.get(str(i), str(i)) for i in range(10)]
-            name = st.selectbox("Class", names, index=1)
-            cid = [i for i, v in enumerate(names) if v == name][0]
+            class_names = [LABELS.get(str(i), str(i)) for i in range(10)]
+            sel = st.selectbox("Class", class_names, index=1)
+            cid = class_names.index(sel)
             idx = st.slider("Index within class", 0, int((ytr == cid).sum() - 1), 0)
             row = np.where(ytr == cid)[0][idx]
-            arr = Xtr[row]
-            title = f"{name} · id {row}"
+
+            arr_orig = Xtr[row]   # already 28×28, [0,1]
+            arr_proc = arr_orig
+            title = f"{sel} · id {row}"
 
         k_neighbors = st.slider("Similar items (k)", 4, 24, 12, step=2)
 
+    # ---------- RIGHT: previews + prediction + neighbors ----------
     with right:
-        st.markdown(f"**{title}**")
-        st.image(to_img(arr), width=180)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Uploaded image")
+            st.image(to_img(arr_orig), width=200)
+        with c2:
+            st.caption("Processed (28×28)")
+            st.image(to_img(arr_proc), width=200)
 
-        xflat = arr.reshape(1, -1)
+        # predict cluster on processed image
+        xflat = arr_proc.reshape(1, -1)
         z = pca.transform(xflat)
         c_pred = int(km.predict(z)[0])
 
-        # map predicted cluster -> majority label id -> readable label
+        # cluster majority (from training-time mapping)
         y_major = c2y.get(c_pred, -1)
-        pretty_label = LABELS.get(str(y_major), str(y_major))
-        st.write(f"**Predicted cluster:** {c_pred}  ·  **Majority label:** {pretty_label}")
+        maj_name = LABELS.get(str(y_major), str(y_major))
+        st.markdown(f"**Predicted cluster:** {c_pred}  ·  **Cluster majority:** {maj_name}")
 
-        # neighbors in PCA space (prefer same cluster if possible)
-        _, idxs = nn.kneighbors(z, n_neighbors=max(k_neighbors, 20), return_distance=True)
+        # nearest neighbors in PCA space (prefer same cluster first)
+        _, idxs = nn.kneighbors(z, n_neighbors=max(k_neighbors * 3, 30), return_distance=True)
         idxs = idxs[0]
-        same = np.where(train_clusters[idxs] == c_pred)[0]
-        idxs = idxs[same[:k_neighbors]] if len(same) >= k_neighbors else idxs[:k_neighbors]
+        same_mask = (train_clusters[idxs] == c_pred)
+        same = idxs[same_mask]
+        rest = idxs[~same_mask]
+        picked = np.concatenate([same[:k_neighbors], rest[:max(0, k_neighbors - len(same))]]).astype(int)
 
-        cols = st.columns(min(6, k_neighbors))
-        for i, ix in enumerate(idxs):
-            cols[i % len(cols)].image(
+        # neighbor vote label (what the nearest training items say)
+        nbr_labels = y_train[picked]
+        counts = np.bincount(nbr_labels, minlength=10)
+        vote_idx = int(np.argmax(counts))
+        vote_name = LABELS.get(str(vote_idx), str(vote_idx))
+        if counts.sum() > 0:
+            st.write(f"**Neighbor vote:** {vote_name} ({counts[vote_idx]}/{counts.sum()})")
+
+        # cluster mix (purity snapshot)
+        clus_counts = np.bincount(y_train[train_clusters == c_pred], minlength=10)
+        if clus_counts.sum() > 0:
+            pct = clus_counts / clus_counts.sum()
+            top3 = np.argsort(pct)[::-1][:3]
+            mix_str = ", ".join([f"{LABELS.get(str(i), str(i))}: {pct[i]:.0%}" for i in top3 if pct[i] > 0])
+            st.caption(f"Cluster {c_pred} mix → {mix_str}")
+
+        # show neighbors
+        st.markdown("**Nearest in PCA space**")
+        grid = min(6, k_neighbors)
+        cols = st.columns(grid)
+        for i, ix in enumerate(picked[:k_neighbors]):
+            ix = int(ix)
+            cols[i % grid].image(
                 to_img(Xtr[ix]),
                 caption=f"id {ix} · c{int(train_clusters[ix])}",
                 width=120
             )
 
-    # show query on PCA(2)
+    # ---------- PCA(2) scatter with query ----------
     st.subheader("Query on PCA(2)")
-    df_sc = pd.DataFrame({"pc1": sc["Z2"][:, 0], "pc2": sc["Z2"][:, 1], "cluster": sc["clusters"].astype(int)})
+    df_sc = pd.DataFrame({
+        "pc1": sc["Z2"][:, 0],
+        "pc2": sc["Z2"][:, 1],
+        "cluster": sc["clusters"].astype(int),
+    })
     fig = px.scatter(df_sc, x="pc1", y="pc2", color="cluster", opacity=0.35)
     fig.add_trace(
-        go.Scatter(x=[z[0, 0]], y=[z[0, 1]], mode="markers", marker_size=12,
-                   marker_symbol="x", marker_color="black", name="query")
+        go.Scatter(
+            x=[z[0, 0]], y=[z[0, 1]], mode="markers",
+            marker_symbol="x", marker_color="black", marker_size=12, name="query"
+        )
     )
     st.plotly_chart(fig, use_container_width=True)
